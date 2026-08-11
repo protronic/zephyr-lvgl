@@ -172,6 +172,30 @@ without the traling _burst in the name when exceution speed is not an issue - e.
 static volatile uint8_t cmd_burst = 0U; /* flag to indicate cmd-burst is active */
 static volatile uint8_t fault_recovered = E_OK; /* flag to indicate if EVE_busy triggered a fault recovery */
 
+/* CANboss: Bytes seit letztem Burst-Start. REG_CMDB fasst nur ~4092 Bytes;
+ * ein durchgehender LVGL-Frame (viele Glyph-Bitmaps) ueberschreibt die FIFO
+ * sonst und faultet den Koprozessor. Vor dem Limit Burst schliessen, Platz
+ * abwarten, Burst fortsetzen - RAM_DL (8 KiB) darf weiter wachsen.
+ *
+ * Chunk < 2048, damit Warten auf EVE_FIFO_HALF_EMPTY (>2048 frei) sicher ist.
+ * Wichtig: letter.c macht mitten im Frame end/memWrite/start - start muss
+ * ebenfalls auf FIFO-Platz warten, sonst ist burst_bytes_out wieder 0 bei
+ * noch voller CMDB. */
+static uint16_t burst_bytes_out = 0U;
+#define EVE_BURST_CHUNK_BYTES 2000U
+/* RAM_DL = 8 KiB. Davor Frame hart abschliessen und restliche LVGL-DL-Worte
+ * verwerfen - sonst Fault-Recovery-Sturm (UI haelt den Bus-Mutex >800 ms). */
+#define EVE_RAM_DL_SOFT_LIMIT 7000U
+static uint8_t eve_dl_skip = 0U;
+
+static void eve_burst_chunk_if_needed(void);
+static void eve_cmdb_wait_space(void);
+
+/* Optionaler Hook (CANboss/Zephyr): Mutex kurz freigeben, damit Shell
+ * ('eve status') waehrend langer FIFO-Wartezeiten antworten kann. */
+void EVE_cmdb_wait_yield(void);
+__attribute__((weak)) void EVE_cmdb_wait_yield(void) {}
+
 /* ##################################################################
     helper functions
 ##################################################################### */
@@ -429,9 +453,90 @@ uint8_t EVE_get_and_reset_fault_state(void)
  */
 void EVE_execute_cmd(void)
 {
-    while (EVE_busy() != E_OK)
+    /* CANboss: Timeout + sofortiger Abbruch nach Fault-Recovery.
+     * EVE_busy() ruft bei Fault CoprocessorFaultRecover()+DELAY_MS(10) auf
+     * und liefert FAULT_RECOVERED (!= E_OK). Ohne Break wuerde die Schleife
+     * bis zum Timeout alle 10 ms erneut resetten. */
+    uint32_t t0 = lv_tick_get();
+    for(;;)
     {
+        uint8_t st = EVE_busy();
+
+        if(st == E_OK)
+        {
+            return;
+        }
+        if(st == EVE_FAULT_RECOVERED)
+        {
+            return;
+        }
+        if(lv_tick_elaps(t0) > 100U)
+        {
+            return;
+        }
     }
+}
+
+/* Wartet bis CMDB genug freien Platz fuer einen Chunk hat (oder Fault/Timeout). */
+static void eve_cmdb_wait_space(void)
+{
+    uint32_t t0 = lv_tick_get();
+
+    for(;;)
+    {
+        uint8_t st = EVE_busy();
+
+        /* E_OK: ~4092 frei. HALF_EMPTY: >2048 frei - reicht fuer CHUNK=2000. */
+        if((st == E_OK) || (st == EVE_FIFO_HALF_EMPTY))
+        {
+            return;
+        }
+        if(st == EVE_FAULT_RECOVERED)
+        {
+            return;
+        }
+        if(lv_tick_elaps(t0) > 100U)
+        {
+            return;
+        }
+        /* Burst ist hier geschlossen - Shell darf SPI kurz nutzen. */
+        EVE_cmdb_wait_yield();
+    }
+}
+
+/* Pause/Fortsetzung eines CMD-Bursts, bevor die 4-KiB-FIFO volllauft.
+ * Zusaetzlich RAM_DL-Fuellstand pruefen und Frame ggf. frueh beenden. */
+static void eve_burst_chunk_if_needed(void)
+{
+    uint32_t dl_size;
+
+    if((cmd_burst == 0U) || (burst_bytes_out < EVE_BURST_CHUNK_BYTES))
+    {
+        return;
+    }
+
+    EVE_end_cmd_burst();
+
+    dl_size = EVE_memRead32(REG_CMD_DL);
+    if(dl_size >= EVE_RAM_DL_SOFT_LIMIT)
+    {
+        eve_cmdb_wait_space();
+        /* Direkt starten ohne erneuten Soft-Limit-Check (burst_bytes=0). */
+        cmd_burst = 42U;
+        burst_bytes_out = 0U;
+        EVE_cs_set();
+        spi_transmit((uint8_t) 0xB0U);
+        spi_transmit((uint8_t) 0x25U);
+        spi_transmit((uint8_t) 0x78U);
+        spi_transmit_burst(DL_DISPLAY);
+        spi_transmit_burst(CMD_SWAP);
+        EVE_end_cmd_burst();
+        eve_dl_skip = 1U;
+        return;
+    }
+
+    /* EVE_start_cmd_burst() wartet selbst auf FIFO-Platz. */
+    EVE_start_cmd_burst();
 }
 
 /* begin a coprocessor command, this is used for non-display-list and non-burst-mode commands.*/
@@ -1688,7 +1793,20 @@ void EVE_start_cmd_burst(void)
     }
 #endif
 
+    /* Frame wurde wegen RAM_DL-Limit bereits mit DISPLAY/SWAP beendet -
+     * keine weiteren CMDB-Schreibungen bis zum naechsten CMD_DLSTART. */
+    if(eve_dl_skip != 0U)
+    {
+        return;
+    }
+
+    /* CANboss: auch ohne DMA warten - letter/image laden beenden den Burst,
+     * schreiben RAM_G und starten neu, waehrend CMDB noch Befehle aus dem
+     * laufenden Frame enthaelt. */
+    eve_cmdb_wait_space();
+
     cmd_burst = 42U;
+    burst_bytes_out = 0U;
 
 #if defined (EVE_DMA)
     EVE_dma_buffer[0U] = 0x7825B000UL; /* REG_CMDB_WRITE + MEM_WRITE low mid hi 00 */
@@ -1710,6 +1828,7 @@ void EVE_start_cmd_burst(void)
 void EVE_end_cmd_burst(void)
 {
     cmd_burst = 0U;
+    burst_bytes_out = 0U;
 
 #if defined (EVE_DMA)
     EVE_start_dma_transfer(); /* begin DMA transfer */
@@ -2611,6 +2730,15 @@ void EVE_cmd_toggle_var_burst(int16_t xc0, int16_t yc0, uint16_t wid, uint16_t f
  */
 void EVE_cmd_dl(uint32_t command)
 {
+    if(command == CMD_DLSTART)
+    {
+        eve_dl_skip = 0U;
+    }
+    if(eve_dl_skip != 0U)
+    {
+        return;
+    }
+
     if (0U == cmd_burst)
     {
         eve_begin_cmd(command);
@@ -2618,7 +2746,13 @@ void EVE_cmd_dl(uint32_t command)
     }
     else
     {
+        eve_burst_chunk_if_needed();
+        if(eve_dl_skip != 0U)
+        {
+            return;
+        }
         spi_transmit_burst(command);
+        burst_bytes_out += 4U;
     }
 }
 
@@ -2627,7 +2761,22 @@ void EVE_cmd_dl(uint32_t command)
  */
 void EVE_cmd_dl_burst(uint32_t command)
 {
+    if(command == CMD_DLSTART)
+    {
+        eve_dl_skip = 0U;
+    }
+    if(eve_dl_skip != 0U)
+    {
+        return;
+    }
+
+    eve_burst_chunk_if_needed();
+    if(eve_dl_skip != 0U)
+    {
+        return;
+    }
     spi_transmit_burst(command);
+    burst_bytes_out += 4U;
 }
 
 /**
